@@ -12,16 +12,38 @@
 #define REMOTE_HOST "127.0.0.1"
 #define REMOTE_PORT 5001
 
+// Global variables for command-line arguments
+int local_port = LOCAL_PORT_TO_CLIENT;
+char remote_host[256] = REMOTE_HOST;
+int remote_port = REMOTE_PORT;
+
 void handle_request(SSL *ssl);
 void send_local_file(SSL *ssl, const char *path);
 void proxy_remote_file(SSL *ssl, const char *request);
 int file_exists(const char *filename);
 
-// TODO: Parse command-line arguments (-b/-r/-p) and override defaults.
+// Parse command-line arguments (-b/-r/-p) and override defaults.
 // Keep behavior consistent with the project spec.
 void parse_args(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    int opt;
+    
+    while ((opt = getopt(argc, argv, "b:r:p:")) != -1) {
+        switch (opt) {
+            case 'b':
+                local_port = atoi(optarg);
+                break;
+            case 'r':
+                strncpy(remote_host, optarg, sizeof(remote_host) - 1);
+                remote_host[sizeof(remote_host) - 1] = '\0';
+                break;
+            case 'p':
+                remote_port = atoi(optarg);
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-b <port>] [-r <host>] [-p <port>]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -74,7 +96,7 @@ int main(int argc, char *argv[]) {
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT);
+    server_addr.sin_port = htons(local_port);
 
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         perror("bind failed");
@@ -89,7 +111,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
+    printf("Proxy server listening on port %d\n", local_port);
 
     while (1) {
         client_len = sizeof(client_addr);
@@ -290,8 +312,8 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     }
 
     remote_addr.sin_family = AF_INET;
-    inet_pton(AF_INET, REMOTE_HOST, &remote_addr.sin_addr);
-    remote_addr.sin_port = htons(REMOTE_PORT);
+    inet_pton(AF_INET, remote_host, &remote_addr.sin_addr);
+    remote_addr.sin_port = htons(remote_port);
 
     if (connect(remote_socket, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == -1) {
         printf("Failed to connect to remote server\n");
