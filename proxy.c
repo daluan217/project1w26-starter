@@ -40,8 +40,7 @@ void parse_args(int argc, char *argv[]) {
                 local_port = (int)val;
                 break;
             case 'r':
-                strncpy(remote_host, optarg, sizeof(remote_host) - 1);
-                remote_host[sizeof(remote_host) - 1] = '\0';
+                snprintf(remote_host, sizeof(remote_host), "%s", optarg);
                 break;
             case 'p':
                 val = strtol(optarg, &endptr, 10);
