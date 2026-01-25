@@ -26,18 +26,30 @@ int file_exists(const char *filename);
 // Keep behavior consistent with the project spec.
 void parse_args(int argc, char *argv[]) {
     int opt;
+    char *endptr;
+    long val;
     
     while ((opt = getopt(argc, argv, "b:r:p:")) != -1) {
         switch (opt) {
             case 'b':
-                local_port = atoi(optarg);
+                val = strtol(optarg, &endptr, 10);
+                if (*endptr != '\0' || val <= 0 || val > 65535) {
+                    fprintf(stderr, "Error: Invalid port number for -b: %s\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                local_port = (int)val;
                 break;
             case 'r':
                 strncpy(remote_host, optarg, sizeof(remote_host) - 1);
                 remote_host[sizeof(remote_host) - 1] = '\0';
                 break;
             case 'p':
-                remote_port = atoi(optarg);
+                val = strtol(optarg, &endptr, 10);
+                if (*endptr != '\0' || val <= 0 || val > 65535) {
+                    fprintf(stderr, "Error: Invalid port number for -p: %s\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                remote_port = (int)val;
                 break;
             default:
                 fprintf(stderr, "Usage: %s [-b <port>] [-r <host>] [-p <port>]\n", argv[0]);
