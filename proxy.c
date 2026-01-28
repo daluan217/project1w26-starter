@@ -148,6 +148,25 @@ int file_exists(const char *filename) {
     return 0;
 }
 
+// TODO: Decode URL-encoded characters (e.g., %20 -> space, %25 -> %)
+void url_decode(char *src, char *dst) {
+    char *p = src;
+    char *q = dst;
+    while (*p) {
+        if (*p == '%' && *(p+1) && *(p+2)) {
+            int hex_value;
+            sscanf(p + 1, "%2x", &hex_value);
+            *q++ = (char)hex_value;
+            p += 3;
+        } else if (*p == '+') {
+            *q++ = ' ';
+            p++;
+        } else {
+            *q++ = *p++;
+        }
+    }
+    *q = '\0';
+}
 // TODO: Parse HTTP request, extract file path, and route to appropriate handler
 // Consider: URL decoding, default files, routing logic for different file types
 void handle_request(SSL *ssl) {
@@ -173,7 +192,7 @@ void handle_request(SSL *ssl) {
     
     char *method = strtok(request, " ");
     char *file_name_raw = strtok(NULL, " ");
-    char *http_version = strtok(NULL, " ");
+    char *http_version = strtok(NULL, " \r\n");
     
     if (method == NULL || strcmp(method, "GET") != 0) {
         fprintf(stderr, "Error: Only GET method is supported\n");
@@ -185,8 +204,16 @@ void handle_request(SSL *ssl) {
         return;
     }
     
+    // Strip any trailing whitespace from http_version
+    if (http_version != NULL) {
+        size_t len = strlen(http_version);
+        while (len > 0 && (http_version[len-1] == '\r' || http_version[len-1] == '\n')) {
+            http_version[--len] = '\0';
+        }
+    }
+    
     if (http_version == NULL || (strcmp(http_version, "HTTP/1.0") != 0 && strcmp(http_version, "HTTP/1.1") != 0)) {
-        fprintf(stderr, "Error: Unsupported HTTP version\n");
+        fprintf(stderr, "Error: Unsupported HTTP version: %s\n", http_version ? http_version : "NULL");
         char *response = "HTTP/1.1 505 HTTP Version Not Supported\r\n"
                          "Content-Type: text/html; charset=UTF-8\r\n\r\n"
                          "<!DOCTYPE html><html><body><h1>505 HTTP Version Not Supported</h1></body></html>";
@@ -197,8 +224,9 @@ void handle_request(SSL *ssl) {
     
     printf("HTTP Method: %s, HTTP Version: %s\n", method, http_version);
     
-    // Handle file path - remove leading slash
+    // Handle file path - remove leading slash and decode URL-encoded characters
     char file_name[BUFFER_SIZE];
+    char file_name_decoded[BUFFER_SIZE];
     if (file_name_raw && strlen(file_name_raw) > 0) {
         strcpy(file_name, file_name_raw);
         // Remove leading slash
@@ -212,12 +240,15 @@ void handle_request(SSL *ssl) {
     } else {
         strcpy(file_name, "index.html");
     }
+    
+    // Decode URL-encoded characters (e.g., %20 -> space)
+    url_decode(file_name, file_name_decoded);
 
-    if (file_exists(file_name)) {
-        printf("Sending local file %s\n", file_name);
-        send_local_file(ssl, file_name);
+    if (file_exists(file_name_decoded)) {
+        printf("Sending local file %s\n", file_name_decoded);
+        send_local_file(ssl, file_name_decoded);
     } else {
-        printf("Proxying remote file %s\n", file_name);
+        printf("Proxying remote file %s\n", file_name_decoded);
         proxy_remote_file(ssl, buffer);
     }
     
