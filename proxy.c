@@ -149,20 +149,24 @@ int file_exists(const char *filename) {
 }
 
 // TODO: Decode URL-encoded characters (e.g., %20 -> space, %25 -> %)
-void url_decode(char *src, char *dst) {
+void url_decode(char *src, char *dst, size_t dst_size) {
     char *p = src;
     char *q = dst;
-    while (*p) {
+    size_t len = 0;
+    while (*p && len < dst_size - 1) {
         if (*p == '%' && *(p+1) && *(p+2)) {
             int hex_value;
             sscanf(p + 1, "%2x", &hex_value);
             *q++ = (char)hex_value;
             p += 3;
+            len++;
         } else if (*p == '+') {
             *q++ = ' ';
             p++;
+            len++;
         } else {
             *q++ = *p++;
+            len++;
         }
     }
     *q = '\0';
@@ -228,21 +232,24 @@ void handle_request(SSL *ssl) {
     char file_name[BUFFER_SIZE];
     char file_name_decoded[BUFFER_SIZE];
     if (file_name_raw && strlen(file_name_raw) > 0) {
-        strcpy(file_name, file_name_raw);
+        strncpy(file_name, file_name_raw, sizeof(file_name) - 1);
+        file_name[sizeof(file_name) - 1] = '\0';
         // Remove leading slash
         if (file_name[0] == '/') {
             memmove(file_name, file_name + 1, strlen(file_name));
         }
         // If empty after removing slash, use index.html
         if (strlen(file_name) == 0) {
-            strcpy(file_name, "index.html");
+            strncpy(file_name, "index.html", sizeof(file_name) - 1);
+            file_name[sizeof(file_name) - 1] = '\0';
         }
     } else {
-        strcpy(file_name, "index.html");
+        strncpy(file_name, "index.html", sizeof(file_name) - 1);
+        file_name[sizeof(file_name) - 1] = '\0';
     }
     
     // Decode URL-encoded characters (e.g., %20 -> space)
-    url_decode(file_name, file_name_decoded);
+    url_decode(file_name, file_name_decoded, sizeof(file_name_decoded));
 
     if (file_exists(file_name_decoded)) {
         printf("Sending local file %s\n", file_name_decoded);
@@ -271,39 +278,38 @@ void send_local_file(SSL *ssl, const char *path) {
                          "Content-Type: text/html; charset=UTF-8\r\n\r\n"
                          "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
                          "<body><h1>404 Not Found</h1></body></html>";
-        // TODO: Send response via SSL
         SSL_write(ssl, response, strlen(response));
-        
         return;
     }
 
-    char *response;
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Determine content type
+    const char *content_type;
     if (strstr(path, ".html")) {
-        response = "HTTP/1.1 200 OK\r\n"
-                   "Content-Type: text/html; charset=UTF-8\r\n\r\n";
+        content_type = "text/html; charset=UTF-8";
     } else if (strstr(path, ".m3u8")) {
-        response = "HTTP/1.1 200 OK\r\n"
-                   "Content-Type: application/vnd.apple.mpegurl\r\n\r\n";
+        content_type = "application/vnd.apple.mpegurl";
     } else if (strstr(path, ".ts")) {
-        response = "HTTP/1.1 200 OK\r\n"
-                   "Content-Type: video/mp2t\r\n\r\n";
+        content_type = "video/mp2t";
     } else if (strstr(path, ".jpg") || strstr(path, ".jpeg")) {
-        response = "HTTP/1.1 200 OK\r\n"
-                   "Content-Type: image/jpeg\r\n\r\n";
+        content_type = "image/jpeg";
     } else if (strstr(path, ".txt")) {
-        response = "HTTP/1.1 200 OK\r\n"
-                   "Content-Type: text/plain; charset=UTF-8\r\n\r\n";
+        content_type = "text/plain; charset=UTF-8";
     } else {
-        // If no extension or unknown extension, treat as binary
-        response = "HTTP/1.1 200 OK\r\n"
-                   "Content-Type: application/octet-stream\r\n\r\n";
+        content_type = "application/octet-stream";
     }
 
-    // TODO: Send response header and file content via SSL
+    // Send response header with Content-Length
+    char response[512];
+    snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", content_type, file_size);
     SSL_write(ssl, response, strlen(response));
 
+    // Send file content
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-        // TODO: Send file data via SSL
         if (SSL_write(ssl, buffer, bytes_read) <= 0) {
             fprintf(stderr, "Error: SSL write failed\n");
             break;
@@ -324,19 +330,26 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     remote_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (remote_socket == -1) {
         fprintf(stderr, "Error: Failed to create remote socket\n");
-        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 94\r\nConnection: close\r\n\r\n"
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
         SSL_write(ssl, response, strlen(response));
         return;
     }
 
     remote_addr.sin_family = AF_INET;
-    inet_pton(AF_INET, REMOTE_HOST, &remote_addr.sin_addr);
+    if (inet_pton(AF_INET, REMOTE_HOST, &remote_addr.sin_addr) <= 0) {
+        fprintf(stderr, "Error: Invalid remote host address\n");
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
+                               "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
+        SSL_write(ssl, response, strlen(response));
+        close(remote_socket);
+        return;
+    }
     remote_addr.sin_port = htons(REMOTE_PORT);
 
     if (connect(remote_socket, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == -1) {
         fprintf(stderr, "Error: Failed to connect to remote server\n");
-        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 94\r\nConnection: close\r\n\r\n"
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
         SSL_write(ssl, response, strlen(response));
         close(remote_socket);
@@ -345,7 +358,7 @@ void proxy_remote_file(SSL *ssl, const char *request) {
 
     if (send(remote_socket, request, strlen(request), 0) < 0) {
         fprintf(stderr, "Error: Failed to send request to remote server\n");
-        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 94\r\nConnection: close\r\n\r\n"
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
         SSL_write(ssl, response, strlen(response));
         close(remote_socket);
