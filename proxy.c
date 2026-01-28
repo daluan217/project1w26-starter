@@ -249,7 +249,10 @@ void handle_request(SSL *ssl) {
         send_local_file(ssl, file_name_decoded);
     } else {
         printf("Proxying remote file %s\n", file_name_decoded);
-        proxy_remote_file(ssl, buffer);
+        // Construct proper HTTP request for backend with decoded filename
+        char backend_request[BUFFER_SIZE];
+        snprintf(backend_request, sizeof(backend_request), "GET /%s HTTP/1.1\r\nHost: localhost:5001\r\nConnection: close\r\n\r\n", file_name_decoded);
+        proxy_remote_file(ssl, backend_request);
     }
     
     free(request);
@@ -287,9 +290,13 @@ void send_local_file(SSL *ssl, const char *path) {
     } else if (strstr(path, ".jpg") || strstr(path, ".jpeg")) {
         response = "HTTP/1.1 200 OK\r\n"
                    "Content-Type: image/jpeg\r\n\r\n";
-    } else {
+    } else if (strstr(path, ".txt")) {
         response = "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/plain; charset=UTF-8\r\n\r\n";
+    } else {
+        // If no extension or unknown extension, treat as binary
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: application/octet-stream\r\n\r\n";
     }
 
     // TODO: Send response header and file content via SSL
@@ -316,7 +323,10 @@ void proxy_remote_file(SSL *ssl, const char *request) {
 
     remote_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (remote_socket == -1) {
-        printf("Failed to create remote socket\n");
+        fprintf(stderr, "Error: Failed to create remote socket\n");
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 94\r\nConnection: close\r\n\r\n"
+                               "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
+        SSL_write(ssl, response, strlen(response));
         return;
     }
 
@@ -325,15 +335,25 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     remote_addr.sin_port = htons(REMOTE_PORT);
 
     if (connect(remote_socket, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == -1) {
-        printf("Failed to connect to remote server\n");
+        fprintf(stderr, "Error: Failed to connect to remote server\n");
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 94\r\nConnection: close\r\n\r\n"
+                               "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
+        SSL_write(ssl, response, strlen(response));
         close(remote_socket);
         return;
     }
 
-    send(remote_socket, request, strlen(request), 0);
+    if (send(remote_socket, request, strlen(request), 0) < 0) {
+        fprintf(stderr, "Error: Failed to send request to remote server\n");
+        const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 94\r\nConnection: close\r\n\r\n"
+                               "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
+        SSL_write(ssl, response, strlen(response));
+        close(remote_socket);
+        return;
+    }
 
     while ((bytes_read = recv(remote_socket, buffer, sizeof(buffer), 0)) > 0) {
-        // TODO: Forward response to client via SSL
+        // Forward response to client via SSL
         if (SSL_write(ssl, buffer, bytes_read) <= 0) {
             fprintf(stderr, "Error: SSL write failed\n");
             break;
