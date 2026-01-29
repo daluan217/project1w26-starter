@@ -2,32 +2,52 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
 #define BUFFER_SIZE 1024
-#define LOCAL_PORT_TO_CLIENT 8443
-#define REMOTE_HOST "127.0.0.1"
-#define REMOTE_PORT 5001
+#define RESPONSE_BUFFER 2048
+static int local_port = 8443;
+static char remote_host[256] = "127.0.0.1";
+static int remote_port = 5001;
 
 void handle_request(SSL *ssl);
 void send_local_file(SSL *ssl, const char *path);
 void proxy_remote_file(SSL *ssl, const char *request);
 int file_exists(const char *filename);
 
-// TODO: Parse command-line arguments (-b/-r/-p) and override defaults.
-// Keep behavior consistent with the project spec.
+// Parse command-line arguments (-b/-r/-p) and override defaults.
 void parse_args(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    int opt;
+    while ((opt = getopt(argc, argv, "b:r:p:")) != -1) {
+        switch (opt) {
+            case 'b':
+                local_port = atoi(optarg);
+                break;
+            case 'r':
+                strncpy(remote_host, optarg, sizeof(remote_host) - 1);
+                remote_host[sizeof(remote_host) - 1] = '\0';
+                break;
+            case 'p':
+                remote_port = atoi(optarg);
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-b port] [-r host] [-p port]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len;
+
+    // Ignore SIGPIPE to prevent crashes when clients disconnect
+    signal(SIGPIPE, SIG_IGN);
 
     parse_args(argc, argv);
 
@@ -74,22 +94,27 @@ int main(int argc, char *argv[]) {
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT);
+    server_addr.sin_port = htons(local_port);
+
+    // Set socket options before bind
+    int optval = 1;
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+        perror("setsockopt failed");
+        close(server_socket);
+        exit(EXIT_FAILURE);
+    }
 
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
 
-    int optval = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-    if (listen(server_socket, 10) == -1) {
+    if (listen(server_socket, SOMAXCONN) == -1) {
         perror("listen failed");
         exit(EXIT_FAILURE);
     }
 
-    printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
+    printf("Proxy server listening on port %d\n", local_port);
 
     while (1) {
         client_len = sizeof(client_addr);
@@ -123,8 +148,8 @@ int main(int argc, char *argv[]) {
             handle_request(ssl);
         }
         
-        // TODO: Clean up SSL connection
-        SSL_shutdown(ssl);
+        // Clean up SSL connection - use unidirectional shutdown to avoid blocking
+        SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
         SSL_free(ssl);
         
         close(client_socket);
@@ -146,6 +171,19 @@ int file_exists(const char *filename) {
         return 1;
     }
     return 0;
+}
+
+// Safely write to SSL, handling errors gracefully
+int safe_ssl_write(SSL *ssl, const char *data, size_t len) {
+    int ret = SSL_write(ssl, data, len);
+    if (ret <= 0) {
+        int err = SSL_get_error(ssl, ret);
+        if (err != SSL_ERROR_ZERO_RETURN && err != SSL_ERROR_WANT_WRITE) {
+            fprintf(stderr, "Warning: SSL write error: %d\n", err);
+        }
+        return 0;
+    }
+    return 1;
 }
 
 // TODO: Decode URL-encoded characters (e.g., %20 -> space, %25 -> %)
@@ -190,7 +228,13 @@ void handle_request(SSL *ssl) {
     }
 
     buffer[bytes_read] = '\0';
-    char *request = malloc(strlen(buffer) + 1);
+    
+    // Make a copy of the request for parsing
+    char *request = malloc(bytes_read + 1);
+    if (!request) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        return;
+    }
     strcpy(request, buffer);
     printf("Received request: %s\n", request);
     
@@ -198,12 +242,24 @@ void handle_request(SSL *ssl) {
     char *file_name_raw = strtok(NULL, " ");
     char *http_version = strtok(NULL, " \r\n");
     
-    if (method == NULL || strcmp(method, "GET") != 0) {
+    if (method == NULL) {
+        fprintf(stderr, "Error: Invalid request - no method\n");
+        free(request);
+        return;
+    }
+    
+    if (strcmp(method, "GET") != 0) {
         fprintf(stderr, "Error: Only GET method is supported\n");
         char *response = "HTTP/1.1 405 Method Not Allowed\r\n"
                          "Content-Type: text/html; charset=UTF-8\r\n\r\n"
                          "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
+        free(request);
+        return;
+    }
+    
+    if (file_name_raw == NULL) {
+        fprintf(stderr, "Error: Invalid request - no path\n");
         free(request);
         return;
     }
@@ -221,7 +277,7 @@ void handle_request(SSL *ssl) {
         char *response = "HTTP/1.1 505 HTTP Version Not Supported\r\n"
                          "Content-Type: text/html; charset=UTF-8\r\n\r\n"
                          "<!DOCTYPE html><html><body><h1>505 HTTP Version Not Supported</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
         free(request);
         return;
     }
@@ -251,14 +307,32 @@ void handle_request(SSL *ssl) {
     // Decode URL-encoded characters (e.g., %20 -> space)
     url_decode(file_name, file_name_decoded, sizeof(file_name_decoded));
 
-    if (file_exists(file_name_decoded)) {
+    // Proxy any .ts request to backend; this is required by spec
+    const int is_video_path = (strncmp(file_name_decoded, "video_server/", 13) == 0);
+    const int is_ts_file = (strstr(file_name_decoded, ".ts") != NULL);
+
+    if (is_video_path || is_ts_file) {
+        printf("Proxying remote file %s\n", file_name_decoded);
+        const char *backend_path = file_name_decoded;
+        if (is_video_path) {
+            // Strip "video_server/" prefix when backend serves from video_server/ directory
+            backend_path = file_name_decoded + 13;
+        }
+        char backend_request[RESPONSE_BUFFER];
+        snprintf(backend_request, sizeof(backend_request),
+                 "GET /%s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
+                 backend_path, remote_host, remote_port);
+        proxy_remote_file(ssl, backend_request);
+    } else if (file_exists(file_name_decoded)) {
         printf("Sending local file %s\n", file_name_decoded);
         send_local_file(ssl, file_name_decoded);
     } else {
-        printf("Proxying remote file %s\n", file_name_decoded);
-        // Construct proper HTTP request for backend with decoded filename
-        char backend_request[BUFFER_SIZE];
-        snprintf(backend_request, sizeof(backend_request), "GET /%s HTTP/1.1\r\nHost: localhost:5001\r\nConnection: close\r\n\r\n", file_name_decoded);
+        printf("Proxying remote file %s (not found locally)\n", file_name_decoded);
+        // Construct proper HTTP request for backend with full path
+        char backend_request[RESPONSE_BUFFER];
+        snprintf(backend_request, sizeof(backend_request),
+             "GET /%s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
+             file_name_decoded, remote_host, remote_port);
         proxy_remote_file(ssl, backend_request);
     }
     
@@ -278,7 +352,7 @@ void send_local_file(SSL *ssl, const char *path) {
                          "Content-Type: text/html; charset=UTF-8\r\n\r\n"
                          "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
                          "<body><h1>404 Not Found</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
         return;
     }
 
@@ -304,13 +378,13 @@ void send_local_file(SSL *ssl, const char *path) {
     }
 
     // Send response header with Content-Length
-    char response[512];
+    char response[RESPONSE_BUFFER];
     snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", content_type, file_size);
-    SSL_write(ssl, response, strlen(response));
+    safe_ssl_write(ssl, response, strlen(response));
 
     // Send file content
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-        if (SSL_write(ssl, buffer, bytes_read) <= 0) {
+        if (!safe_ssl_write(ssl, buffer, bytes_read)) {
             fprintf(stderr, "Error: SSL write failed\n");
             break;
         }
@@ -332,26 +406,26 @@ void proxy_remote_file(SSL *ssl, const char *request) {
         fprintf(stderr, "Error: Failed to create remote socket\n");
         const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
         return;
     }
 
     remote_addr.sin_family = AF_INET;
-    if (inet_pton(AF_INET, REMOTE_HOST, &remote_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, remote_host, &remote_addr.sin_addr) <= 0) {
         fprintf(stderr, "Error: Invalid remote host address\n");
         const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
         close(remote_socket);
         return;
     }
-    remote_addr.sin_port = htons(REMOTE_PORT);
+    remote_addr.sin_port = htons(remote_port);
 
     if (connect(remote_socket, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == -1) {
         fprintf(stderr, "Error: Failed to connect to remote server\n");
         const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
         close(remote_socket);
         return;
     }
@@ -360,14 +434,14 @@ void proxy_remote_file(SSL *ssl, const char *request) {
         fprintf(stderr, "Error: Failed to send request to remote server\n");
         const char *response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 65\r\nConnection: close\r\n\r\n"
                                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
-        SSL_write(ssl, response, strlen(response));
+        safe_ssl_write(ssl, response, strlen(response));
         close(remote_socket);
         return;
     }
 
     while ((bytes_read = recv(remote_socket, buffer, sizeof(buffer), 0)) > 0) {
         // Forward response to client via SSL
-        if (SSL_write(ssl, buffer, bytes_read) <= 0) {
+        if (!safe_ssl_write(ssl, buffer, bytes_read)) {
             fprintf(stderr, "Error: SSL write failed\n");
             break;
         }

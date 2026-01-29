@@ -28,7 +28,12 @@ else
     endif
 endif
 
-all: clean server
+all: certs server
+
+certs:
+	@if [ ! -f server.crt ] || [ ! -f server.key ]; then \
+		bash generate_certs.sh; \
+	fi
 
 server:
 	$(CC) $(CFLAGS) proxy.c -o server $(LDFLAGS)
